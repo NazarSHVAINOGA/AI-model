@@ -1,0 +1,279 @@
+"""Навчання KpiForecaster на симульованій панелі.
+
+Запуск (з кореня проєкту, у активованому .venv)::
+
+    python manage.py copilot_train            # повний цикл: симуляція → навчання → калібрування
+
+Часові розбиття (щоб не було «підглядання в майбутнє»)::
+
+    train  [0, 60)   — навчання
+    val    [60, 66)  — ранній зупин
+    calib  [66, 78)  — калібрування conformal-методу
+    test   [78, 96)  — фінальна оцінка (модель цих місяців не бачила)
+"""
+from __future__ import annotations
+
+import json
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Callable, Dict, Optional
+
+import numpy as np
+import torch
+
+from .features import N_GROUPS, Dataset, dataset_from_panel
+from .model import KpiForecaster, index_nll, observed_index, slice_batch, student_t_nll, to_tensors
+from .simulator import Panel, SimConfig, simulate
+
+ARTIFACTS = Path(__file__).resolve().parent.parent / "artifacts"
+
+SPLITS = {"train": (0, 60), "val": (60, 66), "calib": (66, 78), "test": (78, 96)}
+
+
+@dataclass
+class TrainConfig:
+    window: int = 12
+    d_model: int = 64
+    n_layers: int = 3
+    n_heads: int = 4
+    dropout: float = 0.1
+    lr: float = 2e-3
+    weight_decay: float = 1e-2
+    batch_size: int = 512
+    epochs: int = 40
+    patience: int = 6
+    group_drop: float = 0.2       # ймовірність вимкнути кожну групу ознак
+    group_drop_batch: float = 0.7  # частка батчів, де застосовується груповий dropout
+    seed: int = 0
+    # Групи, які взагалі не подаються на вхід (для ablation-експериментів).
+    disabled_groups: tuple = ()
+
+
+def device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _present_mask(B: int, cfg: TrainConfig, dev: torch.device, training: bool) -> torch.Tensor:
+    present = torch.ones(B, N_GROUPS, device=dev)
+    if training:
+        use = (torch.rand(B, 1, device=dev) < cfg.group_drop_batch).float()
+        drop = (torch.rand(B, N_GROUPS, device=dev) < cfg.group_drop).float()
+        present = 1.0 - drop * use
+    for g in cfg.disabled_groups:
+        present[:, g] = 0.0
+    return present
+
+
+
+
+def train_model(
+    ds_train: Dataset,
+    ds_val: Dataset,
+    cfg: TrainConfig,
+    log: Optional[Callable[[str], None]] = print,
+    checkpoint_path: Optional[Path] = None,
+) -> KpiForecaster:
+    torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
+
+    dev = device()
+    model = KpiForecaster(
+        window=cfg.window,
+        d_model=cfg.d_model,
+        n_layers=cfg.n_layers,
+        n_heads=cfg.n_heads,
+        dropout=cfg.dropout,
+    ).to(dev)
+
+    tr, va = to_tensors(ds_train, dev), to_tensors(ds_val, dev)
+    n = len(ds_train)
+
+    steps_per_epoch = max(1, (n + cfg.batch_size - 1) // cfg.batch_size)
+
+    opt = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay,
+    )
+
+    sched = torch.optim.lr_scheduler.OneCycleLR(
+        opt,
+        max_lr=cfg.lr,
+        total_steps=cfg.epochs * steps_per_epoch,
+        pct_start=0.15,
+    )
+
+    best = float("inf")
+    best_state = None
+    bad = 0
+    start_epoch = 0
+    t0 = time.time()
+
+    # Відновлення попереднього навчання
+    if checkpoint_path is not None and checkpoint_path.exists():
+        if log:
+            log(f"Знайдено checkpoint: {checkpoint_path}")
+            log("Відновлення попереднього навчання...")
+
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+
+        if checkpoint["cfg"] != asdict(cfg):
+            raise RuntimeError(
+                "Конфігурація навчання відрізняється від checkpoint. "
+                "Перевірте параметри або видаліть старий checkpoint."
+            )
+
+        if checkpoint["train_size"] != len(ds_train) or checkpoint["val_size"] != len(ds_val):
+            raise RuntimeError(
+                "Розмір навчальних даних змінився. "
+                "Старий checkpoint не можна використовувати."
+            )
+
+        model.load_state_dict(checkpoint["model_state"])
+        opt.load_state_dict(checkpoint["optimizer_state"])
+        sched.load_state_dict(checkpoint["scheduler_state"])
+
+        best = checkpoint["best"]
+        best_state = checkpoint["best_state"]
+        bad = checkpoint["bad"]
+        start_epoch = checkpoint["epoch"]
+
+        torch.set_rng_state(checkpoint["torch_rng"])
+        np.random.set_state(checkpoint["numpy_rng"])
+
+        if log:
+            log(f"Відновлено після епохи {start_epoch}")
+            log(f"Найкращий val_nll: {best:.4f}")
+
+    for epoch in range(start_epoch, cfg.epochs):
+        model.train()
+        perm = torch.randperm(n, device=dev)
+        tot = 0.0
+
+        for i in range(0, n, cfg.batch_size):
+            idx = perm[i:i + cfg.batch_size]
+            b = slice_batch(tr, idx)
+            present = _present_mask(len(idx), cfg, dev, training=True)
+
+            mu, sigma, nu, mu_i, sig_i = model(b, present)
+
+            loss = student_t_nll(
+                b["y"], mu, sigma, nu, b["ym"]
+            ) + index_nll(
+                observed_index(b, model.wmat), mu_i, sig_i, nu
+            )
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            sched.step()
+
+            tot += loss.item() * len(idx)
+
+        val = evaluate_nll(model, va, cfg)
+
+        if val < best - 1e-4:
+            best = val
+            bad = 0
+            best_state = {
+                k: v.detach().cpu().clone()
+                for k, v in model.state_dict().items()
+            }
+        else:
+            bad += 1
+
+        # Збереження checkpoint після кожної завершеної епохи
+        if checkpoint_path is not None:
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
+            checkpoint = {
+                "epoch": epoch + 1,
+                "model_state": {
+                    k: v.detach().cpu().clone()
+                    for k, v in model.state_dict().items()
+                },
+                "optimizer_state": opt.state_dict(),
+                "scheduler_state": sched.state_dict(),
+                "best": best,
+                "best_state": best_state,
+                "bad": bad,
+                "cfg": asdict(cfg),
+                "train_size": len(ds_train),
+                "val_size": len(ds_val),
+                "torch_rng": torch.get_rng_state(),
+                "numpy_rng": np.random.get_state(),
+            }
+
+            temp_path = checkpoint_path.with_suffix(".tmp")
+            torch.save(checkpoint, temp_path)
+            temp_path.replace(checkpoint_path)
+
+        if log:
+            log(
+                f"epoch {epoch + 1:02d} "
+                f"train_nll={tot / n:.4f} "
+                f"val_nll={val:.4f} "
+                f"best={best:.4f} "
+                f"({time.time() - t0:.0f}s)"
+            )
+
+            if checkpoint_path is not None:
+                log(f"Checkpoint збережено: {checkpoint_path}")
+
+        if bad >= cfg.patience:
+            if log:
+                log("Раннє зупинення")
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    model.eval()
+    return model
+
+
+@torch.no_grad()
+def evaluate_nll(model: KpiForecaster, b: Dict[str, torch.Tensor], cfg: TrainConfig) -> float:
+    model.eval()
+    n = b["y"].shape[0]
+    tot = 0.0
+    for i in range(0, n, 2048):
+        idx = torch.arange(i, min(n, i + 2048), device=b["y"].device)
+        bb = slice_batch(b, idx)
+        present = _present_mask(len(idx), cfg, b["y"].device, training=False)
+        mu, sigma, nu, mu_i, sig_i = model(bb, present)
+        loss = student_t_nll(bb["y"], mu, sigma, nu, bb["ym"]) + index_nll(
+            observed_index(bb, model.wmat), mu_i, sig_i, nu
+        )
+        tot += loss.item() * len(idx)
+    return tot / n
+
+
+def save_model(model: KpiForecaster, cfg: TrainConfig, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"state": model.state_dict(), "cfg": asdict(cfg)}, path)
+
+
+def load_model(path: Path, map_location: str | torch.device = "cpu") -> tuple[KpiForecaster, TrainConfig]:
+    blob = torch.load(path, map_location=map_location, weights_only=False)
+    cfg = TrainConfig(**{**asdict(TrainConfig()), **blob["cfg"]})
+    cfg.disabled_groups = tuple(cfg.disabled_groups)
+    model = KpiForecaster(
+        window=cfg.window, d_model=cfg.d_model, n_layers=cfg.n_layers,
+        n_heads=cfg.n_heads, dropout=cfg.dropout,
+    )
+    model.load_state_dict(blob["state"])
+    return model.to(map_location).eval(), cfg
+
+
+def prepare(sim_cfg: SimConfig | None = None, window: int = 12):
+    panel = simulate(sim_cfg)
+    ds = dataset_from_panel(panel, window=window)
+    parts = {name: ds.time_range(lo, hi) for name, (lo, hi) in SPLITS.items()}
+    return panel, ds, parts
